@@ -1,8 +1,10 @@
-﻿#include "pch.h"
+#include "pch.h"
 #include <windows.h>
 #include <string>
 #include <vector>
 #include "MinHook.h"
+#include <intrin.h>
+#include <unordered_map>
 
 #pragma comment(linker, "/export:GetFileVersionInfoA=C:\\Windows\\System32\\version.GetFileVersionInfoA")
 #pragma comment(linker, "/export:GetFileVersionInfoByHandle=C:\\Windows\\System32\\version.GetFileVersionInfoByHandle")
@@ -32,18 +34,32 @@ struct ModInfo {
 struct ModLoaderAPI {
     uintptr_t(*FindPattern)(const char* pattern);
     void(*Log)(const char* text);
+    const char* modName;
 };
 
 typedef ModInfo* (*GetModInfoFn)();
 typedef void    (*InitializeModFn)(ModLoaderAPI* api);
 
+// 已加载 Mod 列表
+struct LoadedModEntry {
+    HMODULE module;
+    std::string name;
+};
+
+static std::vector<LoadedModEntry> g_loadedMods;
+static CRITICAL_SECTION g_modListCS;
+
+// 为每个 Mod 保留一份独立 API，避免被后续 Mod 覆盖
+static std::vector<ModLoaderAPI*> g_modApis;
+
 // 线程安全日志（Win32 原生，不依赖 C++ 运行时）
-static HANDLE g_hLogFile = INVALID_HANDLE_VALUE;
+static HANDLE            g_hLogFile = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION  g_logCS;
 
 static void Log_Init()
 {
     InitializeCriticalSection(&g_logCS);
+    InitializeCriticalSection(&g_modListCS);
 
     g_hLogFile = CreateFileA(
         "mod_loader.log",
@@ -56,16 +72,18 @@ static void Log_Init()
     );
 
     if (g_hLogFile != INVALID_HANDLE_VALUE) {
-        // 写 UTF-8 BOM
         DWORD written;
         const unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
         WriteFile(g_hLogFile, bom, 3, &written, NULL);
     }
 }
 
-static void Log_Write(const char* text)
+static void Log_Write(const char* prefix, const char* text)
 {
     if (g_hLogFile == INVALID_HANDLE_VALUE) return;
+
+    if (!prefix) prefix = "ModLoader";
+    if (!text) text = "";
 
     EnterCriticalSection(&g_logCS);
 
@@ -75,16 +93,20 @@ static void Log_Write(const char* text)
 
     // 格式化时间字符串：[HH:MM:SS.mmm]
     char timeBuf[32];
-    wsprintfA(timeBuf, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+    wsprintfA(timeBuf, "[%04d-%02d-%02d %02d:%02d:%02d] ",
         st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+        st.wHour, st.wMinute, st.wSecond
     );
 
     // 写入顺序：时间戳 → 前缀 → 正文 → 换行
-    const char prefix[] = "[ModLoader] ";
-    const char suffix[] = "\r\n"; DWORD written;
+    char prefixBuf[256];
+    wsprintfA(prefixBuf, "[%s] ", prefix);
+
+    const char suffix[] = "\r\n";
+    DWORD written = 0;
+
     WriteFile(g_hLogFile, timeBuf, (DWORD)strlen(timeBuf), &written, NULL);
-    WriteFile(g_hLogFile, prefix, (DWORD)(sizeof(prefix) - 1), &written, NULL);
+    WriteFile(g_hLogFile, prefixBuf, (DWORD)strlen(prefixBuf), &written, NULL);
     WriteFile(g_hLogFile, text, (DWORD)strlen(text), &written, NULL);
     WriteFile(g_hLogFile, suffix, (DWORD)(sizeof(suffix) - 1), &written, NULL);
     FlushFileBuffers(g_hLogFile);
@@ -92,10 +114,43 @@ static void Log_Write(const char* text)
     LeaveCriticalSection(&g_logCS);
 }
 
+//由调用地址反查 Mod 名
+static std::string ResolveLogSourceByReturnAddress(void* retAddr)
+{
+    if (!retAddr)
+        return "ModLoader";
+
+    HMODULE hCaller = NULL;
+    if (!GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCSTR)retAddr,
+        &hCaller))
+    {
+        return "ModLoader";
+    }
+
+    std::string result = "ModLoader";
+
+    EnterCriticalSection(&g_modListCS);
+    for (const auto& mod : g_loadedMods)
+    {
+        if (mod.module == hCaller)
+        {
+            result = mod.name;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_modListCS);
+
+    return result;
+}
+
 // 传给Mod 的回调
 static void LogWrapper(const char* text)
 {
-    Log_Write(text);
+    void* retAddr = _ReturnAddress();
+    std::string prefix = ResolveLogSourceByReturnAddress(retAddr);
+    Log_Write(prefix.c_str(), text);
 }
 
 // AOB 扫描
@@ -153,7 +208,7 @@ static DWORD WINAPI LoadMods(LPVOID)
     Sleep(2000);
 
     Log_Init();
-    Log_Write("=== Mod Loader Started ===");
+    Log_Write("ModLoader", "=== Mod Loader Started ===");
 
     // 获取游戏根目录
     char exePath[MAX_PATH] = {};
@@ -164,27 +219,22 @@ static DWORD WINAPI LoadMods(LPVOID)
     std::string modsDir = dir + "\\mods";
     std::string searchPath = modsDir + "\\*.dll";
 
-    Log_Write(("Searching for mods in: " + modsDir).c_str());
+    Log_Write("ModLoader", ("Searching for mods in: " + modsDir).c_str());
 
     // 检查 mods 文件夹
     DWORD attr = GetFileAttributesA(modsDir.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
     {
-        Log_Write("ERROR: 'mods' folder not found.");
+        Log_Write("ModLoader", "ERROR: 'mods' folder not found.");
         return 0;
     }
-
-    // 准备 API（static保证生命周期永久有效）
-    static ModLoaderAPI api;
-    api.FindPattern = FindPattern;
-    api.Log = LogWrapper;
 
     //遍历所有 DLL
     WIN32_FIND_DATAA fd = {};
     HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
     if (hFind == INVALID_HANDLE_VALUE)
     {
-        Log_Write("No DLLs found in mods folder.");
+        Log_Write("ModLoader", "No DLLs found in mods folder.");
         return 0;
     }
 
@@ -194,32 +244,44 @@ static DWORD WINAPI LoadMods(LPVOID)
         std::string fullPath = modsDir + "\\" + dllName; HMODULE hMod = LoadLibraryA(fullPath.c_str());
         if (!hMod)
         {
-            Log_Write(("Error: Could not load " + dllName).c_str());
+            Log_Write("ModLoader", ("Error: Could not load " + dllName).c_str());
             continue;
         }
 
         auto getInfo = (GetModInfoFn)GetProcAddress(hMod, "GetModInfo");
         if (!getInfo)
         {
-            Log_Write(("REJECTED: " + dllName + " (Missing GetModInfo)").c_str());
+            Log_Write("ModLoader", ("REJECTED: " + dllName + " (Missing GetModInfo)").c_str());
             FreeLibrary(hMod);
             continue;
         }
 
         ModInfo* info = getInfo();
-        std::string msg = "SUCCESS: Loaded [" + std::string(info->name) + "]" + " v" + std::string(info->version)
+        std::string msg = "SUCCESS: Loaded [" + std::string(info->name) + "] v" + std::string(info->version)
             + " by " + std::string(info->author);
-        Log_Write(msg.c_str());
+        Log_Write("ModLoader", msg.c_str());
+
+        // 注册模块 -> 名称映射
+        EnterCriticalSection(&g_modListCS);
+        g_loadedMods.push_back({ hMod, info->name ? info->name : dllName });
+        LeaveCriticalSection(&g_modListCS);
+
+        // 为当前 Mod 创建独立 API
+        ModLoaderAPI* modApi = new ModLoaderAPI();
+        modApi->FindPattern = FindPattern;
+        modApi->Log = LogWrapper;
+        modApi->modName = info->name ? info->name : "UnknownMod";
+        g_modApis.push_back(modApi); // 持有生命周期
 
         auto initMod = (InitializeModFn)GetProcAddress(hMod, "InitializeMod");
         if (initMod)
         {
-            initMod(&api);
+            initMod(modApi);
         }
     } while (FindNextFileA(hFind, &fd));
 
     FindClose(hFind);
-    Log_Write("--- Mod Load Sequence Finished ---");
+    Log_Write("ModLoader","--- Mod Load Sequence Finished ---");
     return 0;
 }
 
